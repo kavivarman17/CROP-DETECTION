@@ -1,0 +1,327 @@
+#include <WiFi.h>
+#include <WebServer.h>
+#include <ArduinoJson.h>
+#include <HardwareSerial.h>
+#include <HTTPClient.h>
+
+/* ---------------- WIFI ---------------- */
+
+const char* ssid = "Airtel_Kavivarman"; 
+const char* password = "Kavi@1709";
+
+/* ---------------- HTTP SERVER ---------------- */
+
+WebServer server(80);
+
+/* ---------------- GSM ---------------- */
+
+HardwareSerial SIM800(1);
+
+String senderNumber = "";
+String SMCANO = "";
+bool waitForMessage = false;
+
+/* ---------------- SEND AT COMMAND ---------------- */
+
+void sendCommand(String cmd, int waitTime)
+{
+  Serial.println("CMD: " + cmd);
+
+  SIM800.println(cmd);
+  delay(waitTime);
+
+  while (SIM800.available())
+  {
+    Serial.write(SIM800.read());
+  }
+
+  Serial.println();
+}
+
+/* ---------------- EXTRACT PHONE NUMBER ---------------- */
+
+String extractPhoneNumber(String input)
+{
+  int firstQuote = input.indexOf("\"") + 1;
+  int secondQuote = input.indexOf("\"", firstQuote);
+
+  if (firstQuote > 0 && secondQuote > firstQuote)
+  {
+    return input.substring(firstQuote, secondQuote);
+  }
+
+  return "";
+}
+
+/* ---------------- GET SMS CENTER NUMBER ---------------- */
+
+void extractSMCA()
+{
+  SIM800.println("AT+CSCA?");
+  delay(1000);
+
+  while (SIM800.available())
+  {
+    String line = SIM800.readStringUntil('\n');
+    line.trim();
+
+    Serial.println(line);
+
+    if (line.startsWith("+CSCA:"))
+    {
+      SMCANO = extractPhoneNumber(line);
+      Serial.println("SMSC Number: " + SMCANO);
+    }
+  }
+}
+
+/* ---------------- SEND SMS ---------------- */
+
+void sendSMS(String number, String text)
+{
+  Serial.println("Sending SMS...");
+
+  SIM800.print("AT+CMGS=\"");
+  SIM800.print(number);
+  SIM800.println("\"");
+
+  unsigned long start = millis();
+
+  while (millis() - start < 5000)
+  {
+    if (SIM800.available())
+    {
+      char c = SIM800.read();
+      Serial.write(c);
+
+      if (c == '>')
+      {
+        break;
+      }
+    }
+  }
+
+  SIM800.print(text);
+  delay(500);
+
+  SIM800.write(26);
+
+  Serial.println("\nSMS Sent Command Issued");
+}
+#include <HTTPClient.h>
+
+void sendWhatsApp(String prediction, float confidence, String remedy)
+{
+  HTTPClient http;
+
+  String url = "https://api.twilio.com/2010-04-01/Accounts/ACf4b697bb1164e39e2081f06b13c4ef7f/Messages.json";
+
+  http.begin(url);
+  http.setAuthorization("ACf4b697bb1164e39e2081f06b13c4ef7f", "294f1ca15579ea83c93b7d71f48b7db0");
+
+  http.addHeader("Content-Type", "application/x-www-form-urlencoded");
+
+  // Message build
+  String message = "";
+  message += "Crop Disease Alert\n";
+  message += "Disease: " + prediction + "\n";
+  message += "Confidence: " + String(confidence,2) + "%\n";
+  message += "Remedy: " + remedy;
+
+  // ONLY newline encode
+
+
+  // 🔥 IMPORTANT PART
+  String data = "From=whatsapp:%2B14155238886";
+  data += "&To=whatsapp:%2B919345863809";   // உன் number (with +91)
+  data += "&Body=" + message;
+
+  Serial.println("DATA SENT:");
+  Serial.println(data);
+
+  int response = http.POST(data);
+
+  Serial.print("WhatsApp Response: ");
+  Serial.println(response);
+
+  String responseBody = http.getString();
+  Serial.println("Twilio full response:");
+  Serial.println(responseBody);
+
+  http.end();
+}
+/* ---------------- GSM INITIALIZATION ---------------- */
+
+void initGSM()
+{
+  sendCommand("ATE0",500);
+  sendCommand("AT",500);
+  sendCommand("AT+CFUN=1",500);
+
+  sendCommand("AT+CMGF=1",500);
+  sendCommand("AT+CNMI=2,2,0,0,0",500);
+  sendCommand("AT+CSCS=\"GSM\"",500);
+  sendCommand("AT+CSMP=17,167,0,0",500);
+
+  extractSMCA();
+
+  if (SMCANO.length() > 0)
+  {
+    sendCommand("AT+CSCA=\"" + SMCANO + "\"",500);
+  }
+
+  sendCommand("AT+CREG?",500);
+  sendCommand("AT+CSQ",500);
+}
+
+/* ---------------- RECEIVE PREDICTION FROM ML SERVER ---------------- */
+
+void receivePrediction()
+{
+  if (!server.hasArg("plain"))
+  {
+    Serial.println("No POST body received");
+    server.send(400, "text/plain", "No JSON received");
+    return;
+  }
+
+  String body = server.arg("plain");
+
+  Serial.println("Prediction Received:");
+  Serial.println(body);
+
+  DynamicJsonDocument doc(512);
+
+  DeserializationError error = deserializeJson(doc, body);
+
+  if (error)
+  {
+    Serial.println("JSON Parsing Failed");
+    server.send(400, "text/plain", "JSON Error");
+    return;
+  }
+
+  String prediction = doc["prediction"];
+  float confidence = doc["confidence"];
+  String remedy = doc["remedy"];
+  String phone = doc["phone"];
+
+  Serial.println("----- RESULT -----");
+
+  Serial.print("Disease: ");
+  Serial.println(prediction);
+
+  Serial.print("Confidence: ");
+  Serial.println(confidence);
+
+  Serial.print("Remedy: ");
+  Serial.println(remedy);
+
+  Serial.print("Farmer Number: +91934400");
+  Serial.println(phone);
+
+  Serial.println("------------------");
+
+  /* Build SMS */
+
+  String smsText = "";
+
+  smsText += "Crop Disease Alert\n";
+  smsText += "Disease: " + prediction;
+  smsText += "\nConfidence: " + String(confidence,2) + "%";
+  smsText += "\nRemedy: " + remedy;
+
+  /* Send SMS */
+
+  sendSMS(phone, smsText);
+  Serial.println("Triggering WhatsApp...");
+  sendWhatsApp(prediction, confidence, remedy);
+
+  /* Respond to Python server */
+
+  server.send(200, "application/json", "{\"status\":\"received\"}");
+}
+
+/* ---------------- SETUP ---------------- */
+
+void setup()
+{
+  Serial.begin(115200);
+
+  SIM800.begin(9600, SERIAL_8N1, 16, 17);
+
+  delay(3000);
+
+  Serial.println("SIM800 Starting...");
+
+  initGSM();
+
+  /* WIFI CONNECT */
+
+  WiFi.begin(ssid, password);
+
+  Serial.print("Connecting WiFi");
+
+  while (WiFi.status() != WL_CONNECTED)
+  {
+    delay(500);
+    Serial.print(".");
+  }
+
+  Serial.println();
+
+  Serial.println("WiFi Connected");
+
+  Serial.print("ESP32 IP: ");
+  Serial.println(WiFi.localIP());
+
+  Serial.print("MAC Address: ");
+  Serial.println(WiFi.macAddress());
+
+  /* HTTP ENDPOINT */
+
+  server.on("/prediction", HTTP_POST, receivePrediction);
+
+  server.begin();
+
+  Serial.println("HTTP Server Started");
+}
+
+/* ---------------- LOOP ---------------- */
+
+void loop()
+{
+  server.handleClient();
+
+  /* GSM MESSAGE HANDLING */
+
+  if (SIM800.available())
+  {
+    String line = SIM800.readStringUntil('\n');
+    line.trim();
+
+    if (line.length() == 0) return;
+
+    Serial.println(line);
+
+    if (line.startsWith("+CMT:"))
+    {
+      senderNumber = extractPhoneNumber(line);
+      waitForMessage = true;
+      return;
+    }
+
+    if (waitForMessage)
+    {
+      waitForMessage = false;
+
+      Serial.println("Sender: " + senderNumber);
+      Serial.println("Message: " + line);
+
+      if (line == "hii")
+      {
+        sendSMS(senderNumber, "Hello Farmer!");
+      }
+    }
+  }
+}
